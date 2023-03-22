@@ -10,10 +10,12 @@ from icloudpd.authentication import TwoStepAuthRequiredError, authenticator
 from icloudpd.logger import setup_logger
 from icloudpd.paths import clean_filename
 from pyicloud_ipd.exceptions import PyiCloudAPIResponseError
-from tqdm import tqdm
 from tzlocal import get_localzone
+from tqdm import tqdm
 
 from backup.backends.base import BaseBackend
+from multiprocessing.dummy import Pool
+from functools import partial
 
 DEFAULT_ALBUM = "All Photos"
 PHOTO_SIZE = "original"
@@ -34,21 +36,24 @@ class ICloudPhotosDownloader:
     https://github.com/icloud-photos-downloader/icloud_photos_downloader/blob/master/icloudpd/base.py#L288
 
     """
-    def __init__(self, username: str, password: str, backend: BaseBackend):
+    def __init__(self, username: str, password: str, backend: BaseBackend, concurrency: int = 10):
         self.username = username
         self.password = password
         self.backend = backend
+        self.concurrency = concurrency
 
-    def sync(self):
+    async def sync(self):
         icloud = self.icloud_login()
+        print("Getting photo metadata from album...")
         photos = self.get_core_images(icloud, DEFAULT_ALBUM)
-        for photo in tqdm(self.iter_photos(photos), total=len(photos)):
-            # Check if this photo has already been added to the remote
-            # TODO: Add checksums here
-            if self.backend.exists(photo.remote_path):
-                continue
+        print("Done getting metadata, starting sync...")
 
-            self.sync_photo(icloud, photo)
+        with Pool(self.concurrency) as pool:
+            for _ in tqdm(pool.imap_unordered(
+                partial(self.sync_photo, icloud),
+                self.iter_photos(photos),
+            ), total=len(photos)):
+                pass    
 
     def get_core_images(self, icloud, album_name: str):
         try:
@@ -59,7 +64,6 @@ class ICloudPhotosDownloader:
             raise err
 
     def iter_photos(self, photos):
-        
         for photo in photos:
             filename = clean_filename(photo.filename)
 
@@ -86,15 +90,22 @@ class ICloudPhotosDownloader:
             )
 
     def sync_photo(self, icloud, photo_payload: PhotoContext):
+        # Check if this photo has already been added to the remote
+        # TODO: Add checksums here
+        if self.backend.exists(photo_payload.remote_path):
+            return
+
         with TemporaryDirectory() as download_root:
             download_path = os.path.join(download_root, photo_payload.photo.filename)
 
+            start_time = datetime.now()
             download_result = download.download_media(
                 icloud,
                 photo_payload.photo,
                 download_path,
                 PHOTO_SIZE
             )
+            debug("Download Duration (ms)", datetime.now() - start_time)
 
             self.inject_exif(photo_payload.photo, download_result, download_path, photo_payload.created_date)
 

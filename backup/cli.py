@@ -4,10 +4,29 @@ from backup.config import Settings, BackupBackend
 from dotenv import load_dotenv
 from backup.backends.local import LocalBackend
 from backup.backends.b2 import B2Backend
+from asyncio import run
 
+# FIGLET font: Standard
+MAIN_LOGO = (    
+"""
+                    ___           ___           ___           ___           ___   
+     _____         /  /\         /  /\         /__/|         /__/\         /  /\  
+    /  /::\       /  /::\       /  /:/        |  |:|         \  \:\       /  /::\ 
+   /  /:/\:\     /  /:/\:\     /  /:/         |  |:|          \  \:\     /  /:/\:\ 
+  /  /:/~/::\   /  /:/~/::\   /  /:/  ___   __|  |:|      ___  \  \:\   /  /:/~/:/
+ /__/:/ /:/\:| /__/:/ /:/\:\ /__/:/  /  /\ /__/\_|:|____ /__/\  \__\:\ /__/:/ /:/ 
+ \  \:\/:/~/:/ \  \:\/:/__\/ \  \:\ /  /:/ \  \:\/:::::/ \  \:\ /  /:/ \  \:\/:/  
+  \  \::/ /:/   \  \::/       \  \:\  /:/   \  \::/~~~~   \  \:\  /:/   \  \::/   
+   \  \:\/:/     \  \:\        \  \:\/:/     \  \:\        \  \:\/:/     \  \:\   
+    \  \::/       \  \:\        \  \::/       \  \:\        \  \::/       \  \:\  
+     \__\/         \__\/         \__\/         \__\/         \__\/         \__\/  
+"""
+)
 
 @command()
 def main():
+    print(MAIN_LOGO)
+
     load_dotenv()
 
     config = Settings()
@@ -30,4 +49,4 @@ def main():
         password=None,
         backend=backend,
     )
-    icloud_photos.sync()
+    run(icloud_photos.sync())
