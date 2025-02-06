@@ -271,8 +271,8 @@ def start_jump_transfer(
         source_path=source_path,
         jump_path=jump_path,
         dest_path=dest_path,
-        # Use 2 threads per transfer direction for balance
-        num_threads=2,
+        # Use 1 thread per transfer direction for balance
+        num_threads=1,
     )
     
     # Start parallel transfer
