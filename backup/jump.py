@@ -62,6 +62,10 @@ class TransferManager:
         self.completed_to_dest: Set[Path] = set()
         self.skipped_files: Set[Path] = set()
         
+        # Track current files being processed
+        self.current_jump_files: Set[Path] = set()
+        self.current_dest_files: Set[Path] = set()
+        
         # Threads
         self.to_jump_threads: list[threading.Thread] = []
         self.to_dest_threads: list[threading.Thread] = []
@@ -75,6 +79,9 @@ class TransferManager:
         # Track total files for completion check
         self.total_files = 0
         self.files_found = 0
+        
+        # Lock for updating current files
+        self.current_files_lock = threading.Lock()
         
         rprint(Panel(f"[blue]Starting transfer process[/blue]\nSource: {source_path}\nJump Drive: {jump_path}\nDestination: {dest_path}"))
 
@@ -94,12 +101,13 @@ class TransferManager:
                 if not file_path.is_symlink():
                     relative_path = file_path.relative_to(self.source_path)
                     
-                    # Check if file already exists at destination
+                    # Check if file already exists at final destination
                     dest_path = self.dest_path / relative_path
                     if dest_path.exists():
                         size = file_path.stat().st_size
                         self.skipped_size += size
                         self.skipped_files.add(relative_path)
+                        rprint(f"[dim yellow]⏩ Skipping {relative_path} (already at destination)[/dim yellow]")
                         continue
                         
                     size = file_path.stat().st_size
@@ -135,6 +143,27 @@ class TransferManager:
             f"({self.skipped_size / 1024 / 1024:.1f} MB)"
         ))
 
+    def cleanup_jump_file(self, relative_path: Path) -> None:
+        """Clean up a file from the jump drive after successful transfer.
+        
+        Args:
+            relative_path (Path): Relative path of the file to clean up
+        """
+        jump_file = self.jump_path / relative_path
+        try:
+            jump_file.unlink()
+            # Remove empty parent directories
+            current_dir = jump_file.parent
+            while current_dir != self.jump_path:
+                try:
+                    current_dir.rmdir()
+                    current_dir = current_dir.parent
+                except OSError:
+                    # Directory not empty or already removed
+                    break
+        except Exception as e:
+            rprint(f"[yellow]⚠️  Could not remove file from jump drive: {relative_path} ({str(e)})[/yellow]")
+
     def transfer_worker(
         self,
         queue: Queue[FileTransferTask],
@@ -163,26 +192,43 @@ class TransferManager:
                 
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Determine source path based on stage
-            source_path = task.source if is_jump else (self.jump_path / task.relative_path)
-            
-            # Only proceed if source exists
-            if source_path.exists():
-                try:
-                    shutil.copy2(source_path, dest_path)
-                    
+            # Update current file being processed
+            with self.current_files_lock:
+                if is_jump:
+                    self.current_jump_files.add(task.relative_path)
+                else:
+                    self.current_dest_files.add(task.relative_path)
+
+            try:
+                # Determine source path based on stage
+                source_path = task.source if is_jump else (self.jump_path / task.relative_path)
+                
+                # Only proceed if source exists
+                if source_path.exists():
+                    try:
+                        shutil.copy2(source_path, dest_path)
+                        
+                        if is_jump:
+                            self.transferred_to_jump += task.size
+                            self.completed_to_jump.add(task.relative_path)
+                            # Add to destination queue once copied to jump
+                            self.to_dest_queue.put(task)
+                        else:
+                            self.transferred_to_dest += task.size
+                            self.completed_to_dest.add(task.relative_path)
+                            # Clean up from jump drive after successful transfer
+                            self.cleanup_jump_file(task.relative_path)
+                    except Exception as e:
+                        rprint(f"[red]❌ Error copying {task.relative_path}: {str(e)}[/red]")
+                else:
+                    rprint(f"[yellow]⚠️  Source file not found: {source_path}[/yellow]")
+            finally:
+                # Remove from current files when done
+                with self.current_files_lock:
                     if is_jump:
-                        self.transferred_to_jump += task.size
-                        self.completed_to_jump.add(task.relative_path)
-                        # Add to destination queue once copied to jump
-                        self.to_dest_queue.put(task)
+                        self.current_jump_files.discard(task.relative_path)
                     else:
-                        self.transferred_to_dest += task.size
-                        self.completed_to_dest.add(task.relative_path)
-                except Exception as e:
-                    rprint(f"[red]❌ Error copying {task.relative_path}: {str(e)}[/red]")
-            else:
-                rprint(f"[yellow]⚠️  Source file not found: {source_path}[/yellow]")
+                        self.current_dest_files.discard(task.relative_path)
 
             queue.task_done()
 
@@ -193,29 +239,53 @@ class TransferManager:
         table.add_column("Progress")
         table.add_column("Files")
         table.add_column("Queue Size")
+        table.add_column("Space Used")
+        table.add_column("Current Files")
         
-        # Calculate percentages
+        # Calculate percentages and space usage
         total_size_with_skipped = self.total_size + self.skipped_size
         jump_percent = (self.transferred_to_jump / self.total_size * 100) if self.total_size > 0 else 0
         dest_percent = (self.transferred_to_dest / self.total_size * 100) if self.total_size > 0 else 0
+        
+        # Calculate actual space used on jump drive
+        # We can use transferred_to_dest as the amount cleaned up since we delete files after successful transfer
+        jump_space_used = self.transferred_to_jump - self.transferred_to_dest
+        
+        # Format current files for display
+        with self.current_files_lock:
+            jump_files = ", ".join(str(p) for p in self.current_jump_files) or "None"
+            dest_files = ", ".join(str(p) for p in self.current_dest_files) or "None"
+            
+            # Truncate if too long
+            max_length = 50
+            if len(jump_files) > max_length:
+                jump_files = jump_files[:max_length] + "..."
+            if len(dest_files) > max_length:
+                dest_files = dest_files[:max_length] + "..."
         
         table.add_row(
             "[cyan]To Jump Drive[/cyan]",
             f"{jump_percent:.1f}% ({self.transferred_to_jump / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
             f"{len(self.completed_to_jump)}/{self.total_files} files",
-            f"Queue: {self.to_jump_queue.qsize()}"
+            f"Queue: {self.to_jump_queue.qsize()}",
+            f"Using: {jump_space_used / 1024 / 1024:.1f} MB",
+            f"[dim]{jump_files}[/dim]"
         )
         table.add_row(
             "[cyan]To Destination[/cyan]",
             f"{dest_percent:.1f}% ({self.transferred_to_dest / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
             f"{len(self.completed_to_dest)}/{self.total_files} files",
-            f"Queue: {self.to_dest_queue.qsize()}"
+            f"Queue: {self.to_dest_queue.qsize()}",
+            "",
+            f"[dim]{dest_files}[/dim]"
         )
         if self.skipped_files:
             table.add_row(
                 "[yellow]Skipped[/yellow]",
                 f"100% ({self.skipped_size / 1024 / 1024:.1f} MB)",
                 f"{len(self.skipped_files)} files",
+                "",
+                "",
                 ""
             )
         
