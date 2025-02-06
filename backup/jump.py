@@ -19,6 +19,8 @@ from rich.progress import (
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+from rich import print as rprint
+from rich.panel import Panel
 
 @dataclass
 class FileTransferTask:
@@ -37,6 +39,9 @@ class TransferManager:
         dest_path: Path,
         num_threads: int = 2,
     ):
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source path does not exist: {source_path}")
+            
         self.source_path = source_path
         self.jump_path = jump_path
         self.dest_path = dest_path
@@ -69,17 +74,20 @@ class TransferManager:
         
         # Track total files for completion check
         self.total_files = 0
+        self.files_found = 0
+        
+        rprint(Panel(f"[blue]Starting transfer process[/blue]\nSource: {source_path}\nJump Drive: {jump_path}\nDestination: {dest_path}"))
 
     def scan_files(self) -> Generator[FileTransferTask, None, None]:
-        """Generator that yields file transfer tasks as they're discovered.
+        """Generator that yields file transfer tasks as they're discovered."""
+        rprint("[blue]🔍 Starting file scan...[/blue]")
+        last_status_time = time.time()
         
-        Yields:
-            FileTransferTask: Tasks for each file found
-        """
         for dirpath, _, filenames in os.walk(self.source_path):
             current_path = Path(dirpath)
             for filename in filenames:
                 if self.stop_threads:
+                    rprint("[yellow]⚠️  Scan interrupted[/yellow]")
                     return
                     
                 file_path = current_path / filename
@@ -97,6 +105,13 @@ class TransferManager:
                     size = file_path.stat().st_size
                     self.total_size += size
                     self.total_files += 1
+                    self.files_found += 1
+                    
+                    # Show status every second
+                    current_time = time.time()
+                    if current_time - last_status_time > 1:
+                        rprint(f"[dim]📁 Found {self.files_found} files ({self.total_size / 1024 / 1024:.1f} MB total)[/dim]")
+                        last_status_time = current_time
                     
                     yield FileTransferTask(
                         source=file_path,
@@ -106,18 +121,19 @@ class TransferManager:
 
     def scanner_worker(self) -> None:
         """Worker thread that scans for files and adds them to the queue."""
-        self.console.print("[bold blue]Scanning source directory...[/bold blue]")
-        
         for task in self.scan_files():
             if self.stop_threads:
                 break
             self.to_jump_queue.put(task)
             
         self.scan_complete = True
-        self.console.print(
-            f"[green]Found {self.total_files} files to transfer "
-            f"({len(self.skipped_files)} files already exist at destination)[/green]"
-        )
+        rprint(f"\n[green]✨ Scan complete![/green]")
+        rprint(Panel.fit(
+            f"[green]Found {self.total_files} files to transfer[/green]\n"
+            f"Total size: {self.total_size / 1024 / 1024:.1f} MB\n"
+            f"Skipped {len(self.skipped_files)} existing files "
+            f"({self.skipped_size / 1024 / 1024:.1f} MB)"
+        ))
 
     def transfer_worker(
         self,
@@ -126,6 +142,9 @@ class TransferManager:
         is_jump: bool,
     ) -> None:
         """Worker function for file transfer threads."""
+        stage = "jump drive" if is_jump else "destination"
+        thread_name = threading.current_thread().name
+        
         while not (self.stop_threads or 
                   (self.scan_complete and queue.empty() and
                    ((is_jump and len(self.completed_to_jump) == self.total_files) or
@@ -149,16 +168,21 @@ class TransferManager:
             
             # Only proceed if source exists
             if source_path.exists():
-                shutil.copy2(source_path, dest_path)
-                
-                if is_jump:
-                    self.transferred_to_jump += task.size
-                    self.completed_to_jump.add(task.relative_path)
-                    # Add to destination queue once copied to jump
-                    self.to_dest_queue.put(task)
-                else:
-                    self.transferred_to_dest += task.size
-                    self.completed_to_dest.add(task.relative_path)
+                try:
+                    shutil.copy2(source_path, dest_path)
+                    
+                    if is_jump:
+                        self.transferred_to_jump += task.size
+                        self.completed_to_jump.add(task.relative_path)
+                        # Add to destination queue once copied to jump
+                        self.to_dest_queue.put(task)
+                    else:
+                        self.transferred_to_dest += task.size
+                        self.completed_to_dest.add(task.relative_path)
+                except Exception as e:
+                    rprint(f"[red]❌ Error copying {task.relative_path}: {str(e)}[/red]")
+            else:
+                rprint(f"[yellow]⚠️  Source file not found: {source_path}[/yellow]")
 
             queue.task_done()
 
@@ -168,6 +192,7 @@ class TransferManager:
         table.add_column("Stage")
         table.add_column("Progress")
         table.add_column("Files")
+        table.add_column("Queue Size")
         
         # Calculate percentages
         total_size_with_skipped = self.total_size + self.skipped_size
@@ -175,20 +200,23 @@ class TransferManager:
         dest_percent = (self.transferred_to_dest / self.total_size * 100) if self.total_size > 0 else 0
         
         table.add_row(
-            "To Jump Drive",
-            f"{jump_percent:.1f}% ({self.transferred_to_jump}/{self.total_size} bytes)",
-            f"{len(self.completed_to_jump)}/{self.total_files} files"
+            "[cyan]To Jump Drive[/cyan]",
+            f"{jump_percent:.1f}% ({self.transferred_to_jump / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
+            f"{len(self.completed_to_jump)}/{self.total_files} files",
+            f"Queue: {self.to_jump_queue.qsize()}"
         )
         table.add_row(
-            "To Destination",
-            f"{dest_percent:.1f}% ({self.transferred_to_dest}/{self.total_size} bytes)",
-            f"{len(self.completed_to_dest)}/{self.total_files} files"
+            "[cyan]To Destination[/cyan]",
+            f"{dest_percent:.1f}% ({self.transferred_to_dest / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
+            f"{len(self.completed_to_dest)}/{self.total_files} files",
+            f"Queue: {self.to_dest_queue.qsize()}"
         )
         if self.skipped_files:
             table.add_row(
-                "Skipped (Already Exist)",
-                f"100% ({self.skipped_size} bytes)",
-                f"{len(self.skipped_files)} files"
+                "[yellow]Skipped[/yellow]",
+                f"100% ({self.skipped_size / 1024 / 1024:.1f} MB)",
+                f"{len(self.skipped_files)} files",
+                ""
             )
         
         return table
@@ -200,16 +228,17 @@ class TransferManager:
         self.dest_path.mkdir(parents=True, exist_ok=True)
         
         # Start scanner thread
-        self.scanner_thread = threading.Thread(target=self.scanner_worker)
+        self.scanner_thread = threading.Thread(target=self.scanner_worker, name="Scanner")
         self.scanner_thread.daemon = True
         self.scanner_thread.start()
         
         # Start transfer threads
-        for _ in range(self.num_threads):
+        for i in range(self.num_threads):
             # To jump drive threads
             thread = threading.Thread(
                 target=self.transfer_worker,
-                args=(self.to_jump_queue, self.jump_path, True)
+                args=(self.to_jump_queue, self.jump_path, True),
+                name=f"JumpWorker-{i}"
             )
             thread.daemon = True
             thread.start()
@@ -218,7 +247,8 @@ class TransferManager:
             # To destination threads
             thread = threading.Thread(
                 target=self.transfer_worker,
-                args=(self.to_dest_queue, self.dest_path, False)
+                args=(self.to_dest_queue, self.dest_path, False),
+                name=f"DestWorker-{i}"
             )
             thread.daemon = True
             thread.start()
@@ -238,6 +268,7 @@ class TransferManager:
                         break
                     
         except KeyboardInterrupt:
+            rprint("\n[yellow]⚠️  Transfer interrupted by user[/yellow]")
             self.stop_threads = True
             raise
         
@@ -246,7 +277,11 @@ class TransferManager:
             for thread in [self.scanner_thread] + self.to_jump_threads + self.to_dest_threads:
                 thread.join(timeout=1.0)
 
-        self.console.print("\n[bold green]Transfer complete! ✨[/bold green]")
+        rprint(Panel.fit(
+            "[bold green]✨ Transfer complete![/bold green]\n"
+            f"Transferred: {self.total_files} files ({self.total_size / 1024 / 1024:.1f} MB)\n"
+            f"Skipped: {len(self.skipped_files)} files ({self.skipped_size / 1024 / 1024:.1f} MB)"
+        ))
 
 def start_jump_transfer(
     external_source: str,
