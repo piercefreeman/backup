@@ -1,10 +1,12 @@
-from click import command
+from click import command, group, option
 from backup.icloud import ICloudPhotosDownloader
 from backup.config import Settings, BackupBackend
 from dotenv import load_dotenv
 from backup.backends.local import LocalBackend
 from backup.backends.b2 import B2Backend
 from asyncio import run
+from click import group
+from backup.jump import start_jump_transfer
 
 # FIGLET font: Standard
 MAIN_LOGO = (    
@@ -23,8 +25,12 @@ MAIN_LOGO = (
 """
 )
 
-@command()
+@group()
 def main():
+    pass
+
+@main.command()
+def sync_icloud_photos():
     print(MAIN_LOGO)
 
     load_dotenv()
@@ -50,3 +56,10 @@ def main():
         backend=backend,
     )
     run(icloud_photos.sync())
+
+@main.command()
+@option("--source", required=True, help="Path to source external drive")
+@option("--jump", required=True, help="Path to jump drive")
+@option("--dest", required=True, help="Path to destination external drive")
+def jump_transfer(source: str, jump: str, dest: str):
+    start_jump_transfer(source, jump, dest)
