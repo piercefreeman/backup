@@ -333,8 +333,12 @@ class TransferManager:
             if not is_jump and dest_path.exists():
                 queue.task_done()
                 continue
-                
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                rprint(f"[yellow]⚠️  Could not create parent directory for {dest_path}: {e}[/yellow]")
+                queue.task_done()
+                continue
 
             # Update current file being processed
             with self.current_files_lock:
