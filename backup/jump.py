@@ -4,8 +4,11 @@ import shutil
 import os
 import threading
 from queue import Queue, Empty
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import time
+from re import compile as re_compile
+import json
+from datetime import datetime
 
 from rich.progress import (
     Progress,
@@ -29,6 +32,34 @@ class FileTransferTask:
     relative_path: Path
     size: int
 
+@dataclass
+class DiscoveredFile:
+    """Represents a discovered file and its metadata."""
+    relative_path: str
+    size: int
+    last_modified: float
+    discovered_at: float
+
+@dataclass
+class AlreadyTransferredFile:
+    """Represents a file that has already been transferred."""
+    relative_path: str
+    transferred_at: float
+
+# For now skip patterns just work at the filepath.name level
+SKIP_PATTERNS = [
+    r"\.DS_Store$",
+    r".*\.app$",
+    r".*\.dmg$",
+    r".*\.pkg$",
+    # Personal
+    r"^Adobe Archive$",
+    r"^WindowsSupport$",
+    r"^NCSEXPER$",
+    r"^Applications$",
+    r"^Library$",
+]
+
 class TransferManager:
     """Manages parallel file transfers between source, jump drive, and destination."""
     
@@ -37,6 +68,7 @@ class TransferManager:
         source_path: Path,
         jump_path: Path,
         dest_path: Path,
+        progress_path: Optional[Path] = None,
         num_threads: int = 2,
     ):
         if not source_path.exists():
@@ -45,6 +77,9 @@ class TransferManager:
         self.source_path = source_path
         self.jump_path = jump_path
         self.dest_path = dest_path
+        self.progress_path = progress_path
+        self.discovered_path = progress_path / "discovered.jsonl" if progress_path else None
+        self.transferred_path = progress_path / "transferred.jsonl" if progress_path else None
         self.num_threads = num_threads
         
         # Queues for each transfer stage
@@ -83,49 +118,158 @@ class TransferManager:
         # Lock for updating current files
         self.current_files_lock = threading.Lock()
         
+        self.skip_regexes = [re_compile(pattern) for pattern in SKIP_PATTERNS]
+
+        # Load already transferred files
+        self.transferred_files: Dict[str, AlreadyTransferredFile] = {}
+        if self.transferred_path and self.transferred_path.exists():
+            with self.transferred_path.open("r") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        transferred = AlreadyTransferredFile(**data)
+                        self.transferred_files[transferred.relative_path] = transferred
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            rprint(f"[blue]📚 Loaded {len(self.transferred_files)} previously transferred files[/blue]")
+
         rprint(Panel(f"[blue]Starting transfer process[/blue]\nSource: {source_path}\nJump Drive: {jump_path}\nDestination: {dest_path}"))
 
     def scan_files(self) -> Generator[FileTransferTask, None, None]:
         """Generator that yields file transfer tasks as they're discovered."""
         rprint("[blue]🔍 Starting file scan...[/blue]")
         last_status_time = time.time()
+
+        for file_path in self.iterate_known_paths():
+            if self.stop_threads:
+                rprint("[yellow]⚠️  Scan interrupted[/yellow]")
+                return
+
+            # Convert to Path if it's a string (from discovered files)
+            if isinstance(file_path, str):
+                file_path = self.source_path / file_path
+                
+            # Skip shortcuts, only copy underlying files
+            try:
+                if file_path.is_symlink():
+                    continue
+            except OSError as e:
+                rprint(f"[dim yellow]⏩ Skipping {file_path} {e} (os error)[/dim yellow]")
+                continue
+
+            try:
+                relative_path = file_path.relative_to(self.source_path)
+            except ValueError:
+                rprint(f"[dim yellow]⏩ Skipping {file_path} (not relative to source)[/dim yellow]")
+                continue
+            
+            if self.should_skip(file_path):
+                rprint(f"[dim yellow]⏩ Skipping {relative_path} (in skip list)[/dim yellow]")
+                continue
+
+            # Check if file has already been transferred - if so then we don't need any disk io
+            relative_str = str(relative_path)
+            if relative_str in self.transferred_files:
+                size = file_path.stat().st_size
+                self.skipped_size += size
+                self.skipped_files.add(relative_path)
+                rprint(f"[dim yellow]⏩ Skipping {relative_path} (already transferred)[/dim yellow]")
+                continue
+
+            # Check if file still exists
+            if not file_path.exists(): 
+                rprint(f"[dim yellow]⏩ Skipping {relative_path} (no longer exists)[/dim yellow]")
+                continue
+
+            # Check if file already exists at final destination
+            dest_path = self.dest_path / relative_path
+            if dest_path.exists():
+                size = file_path.stat().st_size
+                self.skipped_size += size
+                self.skipped_files.add(relative_path)   
+                self.save_transferred_file(str(relative_path))
+                rprint(f"[dim yellow]⏩ Skipping {relative_path} (already at destination)[/dim yellow]")
+                continue
+                
+            size = file_path.stat().st_size
+            self.total_size += size
+            self.total_files += 1
+            self.files_found += 1
+
+            # Show status every second
+            current_time = time.time()
+            if current_time - last_status_time > 1:
+                rprint(f"[dim]📁 Found {self.files_found} files ({self.total_size / 1024 / 1024:.1f} MB total)[/dim]")
+                last_status_time = current_time
+            
+            yield FileTransferTask(
+                source=file_path,
+                relative_path=relative_path,
+                size=size,
+            )
+    
+    def iterate_known_paths(self) -> Generator[Path | str, None, None]:
+        """Iterate over both discovered and newly found paths.
         
-        for dirpath, _, filenames in os.walk(self.source_path):
-            current_path = Path(dirpath)
-            for filename in filenames:
-                if self.stop_threads:
-                    rprint("[yellow]⚠️  Scan interrupted[/yellow]")
-                    return
-                    
-                file_path = current_path / filename
-                if not file_path.is_symlink():
-                    relative_path = file_path.relative_to(self.source_path)
-                    
-                    # Check if file already exists at final destination
-                    dest_path = self.dest_path / relative_path
-                    if dest_path.exists():
-                        size = file_path.stat().st_size
-                        self.skipped_size += size
-                        self.skipped_files.add(relative_path)
-                        rprint(f"[dim yellow]⏩ Skipping {relative_path} (already at destination)[/dim yellow]")
+        This is a two-phase generator:
+        1. First yields all previously discovered paths from the discovery file
+        2. Then walks the filesystem to find new paths, saving them as discovered
+        """
+        # Load discovered files if they exist
+        self.discovered_files: Dict[str, DiscoveredFile] = {}
+        discovered_paths = set()
+
+        if self.discovered_path and self.discovered_path.exists():
+            with self.discovered_path.open("r") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line.strip())
+                        discovered = DiscoveredFile(**data)
+                        self.discovered_files[discovered.relative_path] = discovered
+                        discovered_paths.add(discovered.relative_path)
+                    except (json.JSONDecodeError, KeyError):
                         continue
-                        
+            
+            rprint(f"[blue]📚 Loaded {len(self.discovered_files)} previously discovered files[/blue]")
+
+            # First yield all discovered files that still exist
+            for relative_path in discovered_paths:
+                file_path = self.source_path / relative_path
+                if file_path.exists():
+                    yield relative_path
+
+        # We might need to create the parent directory if it doesn't exist
+        if self.discovered_path:
+            self.discovered_path.parent.mkdir(parents=True, exist_ok=True)
+            rprint(f"[blue]📚 Caching discovered files to {self.discovered_path}[/blue]")
+
+        # Now walk the filesystem to find new paths
+        for dirpath, dirnames, filenames in os.walk(self.source_path):
+            current_path = Path(dirpath)
+            relative_path = current_path.relative_to(self.source_path)
+
+            # Check if the current directory should be skipped
+            # If it should be skipped, remove all subdirs from dirnames to prevent descent
+            if str(relative_path) != "." and self.should_skip(current_path):
+                rprint(f"[dim yellow]⏩ Skipping directory {relative_path} and its contents (in skip list)[/dim yellow]")
+                dirnames.clear()  # This prevents os.walk from descending into this directory
+                continue
+        
+            for filename in filenames:
+                file_path = current_path / filename
+                relative_str = str(file_path.relative_to(self.source_path))
+
+                # Skip if we've already seen this file
+                if relative_str in discovered_paths:
+                    continue
+
+                # Save this discovered file
+                try:
                     size = file_path.stat().st_size
-                    self.total_size += size
-                    self.total_files += 1
-                    self.files_found += 1
-                    
-                    # Show status every second
-                    current_time = time.time()
-                    if current_time - last_status_time > 1:
-                        rprint(f"[dim]📁 Found {self.files_found} files ({self.total_size / 1024 / 1024:.1f} MB total)[/dim]")
-                        last_status_time = current_time
-                    
-                    yield FileTransferTask(
-                        source=file_path,
-                        relative_path=relative_path,
-                        size=size,
-                    )
+                    self.save_discovered_file(file_path, size)
+                    yield file_path
+                except (OSError, FileNotFoundError):
+                    continue
 
     def scanner_worker(self) -> None:
         """Worker thread that scans for files and adds them to the queue."""
@@ -137,7 +281,7 @@ class TransferManager:
         self.scan_complete = True
         rprint(f"\n[green]✨ Scan complete![/green]")
         rprint(Panel.fit(
-            f"[green]Found {self.total_files} files to transfer[/green]\n"
+            "[green]Found {self.total_files} files to transfer[/green]\n"
             f"Total size: {self.total_size / 1024 / 1024:.1f} MB\n"
             f"Skipped {len(self.skipped_files)} existing files "
             f"({self.skipped_size / 1024 / 1024:.1f} MB)"
@@ -198,6 +342,7 @@ class TransferManager:
                     self.current_jump_files.add(task.relative_path)
                 else:
                     self.current_dest_files.add(task.relative_path)
+            rprint(f"[dim]🔍 Transferring {task.relative_path} to {stage}[/dim]")
 
             try:
                 # Determine source path based on stage
@@ -207,6 +352,7 @@ class TransferManager:
                 if source_path.exists():
                     try:
                         shutil.copy2(source_path, dest_path)
+                        rprint(f"[green]✅ Transferred {task.relative_path} to {stage}[/green]")
                         
                         if is_jump:
                             self.transferred_to_jump += task.size
@@ -216,7 +362,8 @@ class TransferManager:
                         else:
                             self.transferred_to_dest += task.size
                             self.completed_to_dest.add(task.relative_path)
-                            # Clean up from jump drive after successful transfer
+                            # Save as transferred and clean up from jump drive after successful transfer
+                            self.save_transferred_file(str(task.relative_path))
                             self.cleanup_jump_file(task.relative_path)
                     except Exception as e:
                         rprint(f"[red]❌ Error copying {task.relative_path}: {str(e)}[/red]")
@@ -352,11 +499,60 @@ class TransferManager:
             f"Transferred: {self.total_files} files ({self.total_size / 1024 / 1024:.1f} MB)\n"
             f"Skipped: {len(self.skipped_files)} files ({self.skipped_size / 1024 / 1024:.1f} MB)"
         ))
+    
+    def should_skip(self, file_path: Path) -> bool:
+        """Determine if a file should be skipped based on patterns."""
+        # Right now we assume this list is small enough to iterate over for every filepath, if we start
+        # adding automatically generated patterns we'll need to build out a treelike iterator
+
+        # Independently check each level of the filepath
+        if any(regex.match(file_path.name) for regex in self.skip_regexes):
+            return True
+
+        return False
+
+    def save_discovered_file(self, file_path: Path, size: int) -> None:
+        """Save a discovered file to the discovered_path if it exists."""
+        if not self.discovered_path:
+            return
+
+        relative_path = str(file_path.relative_to(self.source_path))
+        discovered = DiscoveredFile(
+            relative_path=relative_path,
+            size=size,
+            last_modified=file_path.stat().st_mtime,
+            discovered_at=time.time(),
+        )
+
+        # Only write if we haven't seen this file before
+        if relative_path not in self.discovered_files:
+            self.discovered_files[relative_path] = discovered
+            # Append to the file
+            with open(self.discovered_path, "a") as f:
+                f.write(json.dumps(asdict(discovered)) + "\n")
+
+    def save_transferred_file(self, relative_path: str) -> None:
+        """Save a transferred file to the transferred_path if it exists."""
+        if not self.transferred_path:
+            return
+
+        transferred = AlreadyTransferredFile(
+            relative_path=relative_path,
+            transferred_at=time.time(),
+        )
+
+        # Only write if we haven't seen this file before
+        if relative_path not in self.transferred_files:
+            self.transferred_files[relative_path] = transferred
+            # Append to the file
+            with open(self.transferred_path, "a") as f:
+                f.write(json.dumps(asdict(transferred)) + "\n")
 
 def start_jump_transfer(
     external_source: str,
     jump_drive: str,
     external_dest: str,
+    progress: Optional[str] = None,
 ) -> None:
     """Main function to handle the parallel file transfer process.
     
@@ -364,10 +560,12 @@ def start_jump_transfer(
         external_source (str): Path to the source external drive
         jump_drive (str): Path to the jump drive
         external_dest (str): Path to the destination external drive
+        progress_path (Optional[str]): Path to save/load discovered files
     """
     source_path = Path(external_source)
     jump_path = Path(jump_drive)
     dest_path = Path(external_dest)
+    progress_path = Path(progress) if progress else None
     
     if not source_path.exists():
         raise FileNotFoundError(f"Source path does not exist: {source_path}")
@@ -376,6 +574,7 @@ def start_jump_transfer(
         source_path=source_path,
         jump_path=jump_path,
         dest_path=dest_path,
+        progress_path=progress_path,
         # Use 1 thread per transfer direction for balance
         num_threads=1,
     )

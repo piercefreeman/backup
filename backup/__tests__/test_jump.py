@@ -160,3 +160,79 @@ def test_skip_existing_files(test_file_structure: Tuple[Path, dict[str, bytes]],
     # Verify jump drive is empty
     jump_files = list(jump_path.glob("**/*"))
     assert not any(f.is_file() for f in jump_files), "Jump drive should be empty after transfer"
+
+def test_should_skip_patterns(transfer_paths: Tuple[Path, Path, Path]):
+    """Test that should_skip correctly identifies files to skip."""
+    source_dir, jump_path, dest_path = transfer_paths
+    manager = TransferManager(
+        source_path=source_dir,
+        jump_path=jump_path,
+        dest_path=dest_path,
+    )
+    
+    # Test .app bundle
+    app_path = Path("Adobe Archive/Adobe Flash CS4/Adobe Flash CS4.app")
+    assert manager.should_skip(app_path), "Should skip .app bundles"
+    
+    # Test other common skip patterns
+    assert manager.should_skip(Path(".DS_Store")), "Should skip .DS_Store"
+    assert manager.should_skip(Path("Application.dmg")), "Should skip .dmg"
+    assert manager.should_skip(Path("installer.pkg")), "Should skip .pkg"
+    
+    # Test files that shouldn't be skipped
+    assert not manager.should_skip(Path("normal.txt")), "Should not skip normal files"
+    assert not manager.should_skip(Path("image.jpg")), "Should not skip images"
+    assert not manager.should_skip(Path("document.pdf")), "Should not skip PDFs"
+    assert not manager.should_skip(Path("data.json")), "Should not skip data files"
+    
+    # Test paths with dots but not matching patterns
+    assert not manager.should_skip(Path("backup.dmg.txt")), "Should not skip if extension is part of name"
+    
+    # Test paths with special characters
+    assert not manager.should_skip(Path("file with spaces.txt")), "Should handle spaces"
+    assert not manager.should_skip(Path("special!@#$%^&.txt")), "Should handle special characters"
+
+def test_discovered_files(test_file_structure: Tuple[Path, dict[str, bytes]], transfer_paths: Tuple[Path, Path, Path]):
+    """Test that discovered files are properly loaded and processed."""
+    source_dir, jump_path, dest_path = transfer_paths
+    setup_source_files(source_dir, test_file_structure)
+    
+    # Create a temporary discovered files path
+    with tempfile.TemporaryDirectory() as dir:
+        progress_path = Path(dir)
+        
+        # First run - create the discovered files
+        manager = TransferManager(
+            source_path=source_dir,
+            jump_path=jump_path,
+            dest_path=dest_path,
+            progress_path=progress_path,
+        )
+        
+        # Run the transfer
+        manager.start_transfer()
+        
+        # Verify files were discovered and saved
+        assert progress_path.exists()
+        discovered_lines = manager.discovered_path.read_text().strip().split("\n")
+        assert len(discovered_lines) == len(test_file_structure[1])
+        
+        # Create a new file in the source directory
+        new_file = source_dir / "new_file.txt"
+        new_content = b"New file content"
+        new_file.write_bytes(new_content)
+        
+        # Second run - should load discovered files and find the new one
+        manager = TransferManager(
+            source_path=source_dir,
+            jump_path=jump_path,
+            dest_path=dest_path,
+            progress_path=progress_path,
+        )
+        
+        # Collect all tasks from generator to verify discovered + new files
+        tasks = list(manager.scan_files())
+        
+        # Since we've already scanned the files, we should only get one task
+        assert len(tasks) == 1
+        
