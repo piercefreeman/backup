@@ -13,8 +13,19 @@ Environment variables are expected to be set in a `.env` file in the root of the
 
 ## Getting Started
 
-There's one CLI command, that's it. Run it and it will backup all services.
+There's one CLI command, that's it. Run `backup` to see the options:
 
+```bash
+uv run backup
 ```
-poetry run backup
+
+```bash
+uv run backup sync-icloud-photos
 ```
+
+To transfer files from one drive to another (using the jump drive as the intermediary). This is helpful if you might have networking or hardware issues that prevent copying from one NAS to another:
+
+```bash
+uv run backup jump-transfer --source /Volumes/Drobo/ --jump /Volumes/Media1/jump --dest /Volumes/Media --progress-path transfer-1
+```
+
