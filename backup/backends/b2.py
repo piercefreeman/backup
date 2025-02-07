@@ -25,16 +25,16 @@ class B2Backend(BaseBackend):
             service_name="s3",
             endpoint_url=endpoint,
             aws_access_key_id=key_id,
-            aws_secret_access_key=application_key
+            aws_secret_access_key=application_key,
         )
         self.b2_resource = resource(
-            service_name='s3',
+            service_name="s3",
             endpoint_url=endpoint,
             aws_access_key_id=key_id,
             aws_secret_access_key=application_key,
             config=Config(
-                signature_version='s3v4',
-            )
+                signature_version="s3v4",
+            ),
         )
         self.bucket_name = bucket_name
 

@@ -12,7 +12,7 @@ class BackupBackend(Enum):
 
 class Settings(BaseSettings):
     class Config:
-        env_nested_delimiter = '__'
+        env_nested_delimiter = "__"
 
     icloud_photos_username: str
 
