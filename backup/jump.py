@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Literal, Dict, Set, Generator, Optional
+from typing import Literal, Dict, Set, Generator, Optional, Callable
 import shutil
 import os
 import threading
@@ -46,6 +46,91 @@ class AlreadyTransferredFile:
     relative_path: str
     transferred_at: float
 
+@dataclass
+class DirectionalSync:
+    """Handles file transfer between a source and destination path."""
+    source_path: Path
+    dest_path: Path
+    queue: Queue[FileTransferTask]
+    current_files: Set[Path]
+    current_files_lock: threading.Lock
+    stop_threads: bool = False
+    scan_complete: bool = False
+    total_files: int = 0
+    completed_files: Set[Path] = None
+    transferred_bytes: int = 0
+    name: str = ""
+    # Optional callbacks for post-transfer actions
+    on_transfer_complete: Optional[Callable[[FileTransferTask], None]] = None
+    on_cleanup: Optional[Callable[[Path], None]] = None
+
+    def __post_init__(self):
+        if self.completed_files is None:
+            self.completed_files = set()
+
+    def transfer_worker(self, thread_id: int) -> None:
+        """Worker function for file transfer threads."""
+        thread_name = f"{self.name}-{thread_id}"
+        
+        while not (self.stop_threads or 
+                  (self.scan_complete and self.queue.empty() and
+                   len(self.completed_files) == self.total_files)):
+            try:
+                task = self.queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            dest_path = self.dest_path / task.relative_path
+            
+            # Skip if file exists at destination (double-check)
+            if dest_path.exists():
+                self.queue.task_done()
+                continue
+
+            try:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                rprint(f"[yellow]⚠️  Could not create parent directory for {dest_path}: {e}[/yellow]")
+                self.queue.task_done()
+                continue
+
+            # Update current file being processed
+            with self.current_files_lock:
+                self.current_files.add(task.relative_path)
+
+            rprint(f"[dim]🔍 Transferring {task.relative_path} to {self.name}[/dim]")
+
+            try:
+                source_path = self.source_path / task.relative_path
+                
+                # Only proceed if source exists
+                if source_path.exists():
+                    try:
+                        shutil.copy2(source_path, dest_path)
+                        rprint(f"[green]✅ Transferred {task.relative_path} to {self.name}[/green]")
+                        
+                        self.transferred_bytes += task.size
+                        self.completed_files.add(task.relative_path)
+
+                        # Call post-transfer callback if provided
+                        if self.on_transfer_complete:
+                            self.on_transfer_complete(task)
+
+                        # Call cleanup callback if provided
+                        if self.on_cleanup:
+                            self.on_cleanup(task.relative_path)
+
+                    except Exception as e:
+                        rprint(f"[red]❌ Error copying {task.relative_path}: {str(e)}[/red]")
+                else:
+                    rprint(f"[yellow]⚠️  Source file not found: {source_path}[/yellow]")
+            finally:
+                # Remove from current files when done
+                with self.current_files_lock:
+                    self.current_files.discard(task.relative_path)
+
+            self.queue.task_done()
+
 # For now skip patterns just work at the filepath.name level
 SKIP_PATTERNS = [
     r"\.DS_Store$",
@@ -88,23 +173,14 @@ class TransferManager:
         
         # Track progress
         self.total_size = 0
-        self.transferred_to_jump = 0
-        self.transferred_to_dest = 0
         self.skipped_size = 0
         
         # Track completed files
-        self.completed_to_jump: Set[Path] = set()
-        self.completed_to_dest: Set[Path] = set()
         self.skipped_files: Set[Path] = set()
         
         # Track current files being processed
         self.current_jump_files: Set[Path] = set()
         self.current_dest_files: Set[Path] = set()
-        
-        # Threads
-        self.to_jump_threads: list[threading.Thread] = []
-        self.to_dest_threads: list[threading.Thread] = []
-        self.scanner_thread: Optional[threading.Thread] = None
         
         # Control flags
         self.stop_threads = False
@@ -119,6 +195,28 @@ class TransferManager:
         self.current_files_lock = threading.Lock()
         
         self.skip_regexes = [re_compile(pattern) for pattern in SKIP_PATTERNS]
+
+        # Create sync managers
+        self.jump_sync = DirectionalSync(
+            source_path=source_path,
+            dest_path=jump_path,
+            queue=self.to_jump_queue,
+            current_files=self.current_jump_files,
+            current_files_lock=self.current_files_lock,
+            name="jump drive",
+            on_transfer_complete=lambda task: self.to_dest_queue.put(task)
+        )
+        
+        self.dest_sync = DirectionalSync(
+            source_path=jump_path,
+            dest_path=dest_path,
+            queue=self.to_dest_queue,
+            current_files=self.current_dest_files,
+            current_files_lock=self.current_files_lock,
+            name="destination",
+            on_transfer_complete=lambda task: self.save_transferred_file(str(task.relative_path)),
+            on_cleanup=self.cleanup_jump_file
+        )
 
         # Load already transferred files
         self.transferred_files: Dict[str, AlreadyTransferredFile] = {}
@@ -279,6 +377,8 @@ class TransferManager:
             self.to_jump_queue.put(task)
             
         self.scan_complete = True
+        self.jump_sync.scan_complete = True
+        self.dest_sync.scan_complete = True
         rprint(f"\n[green]✨ Scan complete![/green]")
         rprint(Panel.fit(
             "[green]Found {self.total_files} files to transfer[/green]\n"
@@ -308,81 +408,6 @@ class TransferManager:
         except Exception as e:
             rprint(f"[yellow]⚠️  Could not remove file from jump drive: {relative_path} ({str(e)})[/yellow]")
 
-    def transfer_worker(
-        self,
-        queue: Queue[FileTransferTask],
-        base_dest: Path,
-        is_jump: bool,
-    ) -> None:
-        """Worker function for file transfer threads."""
-        stage = "jump drive" if is_jump else "destination"
-        thread_name = threading.current_thread().name
-        
-        while not (self.stop_threads or 
-                  (self.scan_complete and queue.empty() and
-                   ((is_jump and len(self.completed_to_jump) == self.total_files) or
-                    (not is_jump and len(self.completed_to_dest) == len(self.completed_to_jump))))):
-            try:
-                task = queue.get(timeout=0.5)
-            except Empty:
-                continue
-
-            dest_path = base_dest / task.relative_path
-            
-            # Skip if file exists at final destination (double-check)
-            if not is_jump and dest_path.exists():
-                queue.task_done()
-                continue
-            try:
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                rprint(f"[yellow]⚠️  Could not create parent directory for {dest_path}: {e}[/yellow]")
-                queue.task_done()
-                continue
-
-            # Update current file being processed
-            with self.current_files_lock:
-                if is_jump:
-                    self.current_jump_files.add(task.relative_path)
-                else:
-                    self.current_dest_files.add(task.relative_path)
-            rprint(f"[dim]🔍 Transferring {task.relative_path} to {stage}[/dim]")
-
-            try:
-                # Determine source path based on stage
-                source_path = task.source if is_jump else (self.jump_path / task.relative_path)
-                
-                # Only proceed if source exists
-                if source_path.exists():
-                    try:
-                        shutil.copy2(source_path, dest_path)
-                        rprint(f"[green]✅ Transferred {task.relative_path} to {stage}[/green]")
-                        
-                        if is_jump:
-                            self.transferred_to_jump += task.size
-                            self.completed_to_jump.add(task.relative_path)
-                            # Add to destination queue once copied to jump
-                            self.to_dest_queue.put(task)
-                        else:
-                            self.transferred_to_dest += task.size
-                            self.completed_to_dest.add(task.relative_path)
-                            # Save as transferred and clean up from jump drive after successful transfer
-                            self.save_transferred_file(str(task.relative_path))
-                            self.cleanup_jump_file(task.relative_path)
-                    except Exception as e:
-                        rprint(f"[red]❌ Error copying {task.relative_path}: {str(e)}[/red]")
-                else:
-                    rprint(f"[yellow]⚠️  Source file not found: {source_path}[/yellow]")
-            finally:
-                # Remove from current files when done
-                with self.current_files_lock:
-                    if is_jump:
-                        self.current_jump_files.discard(task.relative_path)
-                    else:
-                        self.current_dest_files.discard(task.relative_path)
-
-            queue.task_done()
-
     def create_progress_table(self) -> Table:
         """Create a progress table for display."""
         table = Table()
@@ -394,13 +419,12 @@ class TransferManager:
         table.add_column("Current Files")
         
         # Calculate percentages and space usage
-        total_size_with_skipped = self.total_size + self.skipped_size
-        jump_percent = (self.transferred_to_jump / self.total_size * 100) if self.total_size > 0 else 0
-        dest_percent = (self.transferred_to_dest / self.total_size * 100) if self.total_size > 0 else 0
+        jump_percent = (self.jump_sync.transferred_bytes / self.total_size * 100) if self.total_size > 0 else 0
+        dest_percent = (self.dest_sync.transferred_bytes / self.total_size * 100) if self.total_size > 0 else 0
         
         # Calculate actual space used on jump drive
         # We can use transferred_to_dest as the amount cleaned up since we delete files after successful transfer
-        jump_space_used = self.transferred_to_jump - self.transferred_to_dest
+        jump_space_used = self.jump_sync.transferred_bytes - self.dest_sync.transferred_bytes
         
         # Format current files for display
         with self.current_files_lock:
@@ -416,16 +440,16 @@ class TransferManager:
         
         table.add_row(
             "[cyan]To Jump Drive[/cyan]",
-            f"{jump_percent:.1f}% ({self.transferred_to_jump / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
-            f"{len(self.completed_to_jump)}/{self.total_files} files",
+            f"{jump_percent:.1f}% ({self.jump_sync.transferred_bytes / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
+            f"{len(self.jump_sync.completed_files)}/{self.total_files} files",
             f"Queue: {self.to_jump_queue.qsize()}",
             f"Using: {jump_space_used / 1024 / 1024:.1f} MB",
             f"[dim]{jump_files}[/dim]"
         )
         table.add_row(
             "[cyan]To Destination[/cyan]",
-            f"{dest_percent:.1f}% ({self.transferred_to_dest / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
-            f"{len(self.completed_to_dest)}/{self.total_files} files",
+            f"{dest_percent:.1f}% ({self.dest_sync.transferred_bytes / 1024 / 1024:.1f}/{self.total_size / 1024 / 1024:.1f} MB)",
+            f"{len(self.dest_sync.completed_files)}/{self.total_files} files",
             f"Queue: {self.to_dest_queue.qsize()}",
             "",
             f"[dim]{dest_files}[/dim]"
@@ -447,6 +471,10 @@ class TransferManager:
         # Create destination directories
         self.jump_path.mkdir(parents=True, exist_ok=True)
         self.dest_path.mkdir(parents=True, exist_ok=True)
+
+        # Update total files for both sync managers
+        self.jump_sync.total_files = self.total_files
+        self.dest_sync.total_files = self.total_files
         
         # Start scanner thread
         self.scanner_thread = threading.Thread(target=self.scanner_worker, name="Scanner")
@@ -454,48 +482,53 @@ class TransferManager:
         self.scanner_thread.start()
         
         # Start transfer threads
+        to_jump_threads = []
+        to_dest_threads = []
+        
         for i in range(self.num_threads):
             # To jump drive threads
             thread = threading.Thread(
-                target=self.transfer_worker,
-                args=(self.to_jump_queue, self.jump_path, True),
+                target=self.jump_sync.transfer_worker,
+                args=(i,),
                 name=f"JumpWorker-{i}"
             )
             thread.daemon = True
             thread.start()
-            self.to_jump_threads.append(thread)
+            to_jump_threads.append(thread)
             
             # To destination threads
             thread = threading.Thread(
-                target=self.transfer_worker,
-                args=(self.to_dest_queue, self.dest_path, False),
+                target=self.dest_sync.transfer_worker,
+                args=(i,),
                 name=f"DestWorker-{i}"
             )
             thread.daemon = True
             thread.start()
-            self.to_dest_threads.append(thread)
+            to_dest_threads.append(thread)
 
         try:
             # Display progress
             with Live(self.create_progress_table(), refresh_per_second=4) as live:
-                while any(thread.is_alive() for thread in [self.scanner_thread] + self.to_jump_threads + self.to_dest_threads):
+                while any(thread.is_alive() for thread in [self.scanner_thread] + to_jump_threads + to_dest_threads):
                     live.update(self.create_progress_table())
                     time.sleep(0.25)
                     
                     # Extra completion check
                     if (self.scan_complete and
-                        len(self.completed_to_jump) == self.total_files and 
-                        len(self.completed_to_dest) == self.total_files):
+                        len(self.jump_sync.completed_files) == self.total_files and 
+                        len(self.dest_sync.completed_files) == self.total_files):
                         break
                     
         except KeyboardInterrupt:
             rprint("\n[yellow]⚠️  Transfer interrupted by user[/yellow]")
             self.stop_threads = True
+            self.jump_sync.stop_threads = True
+            self.dest_sync.stop_threads = True
             raise
         
         finally:
             # Wait for threads to finish
-            for thread in [self.scanner_thread] + self.to_jump_threads + self.to_dest_threads:
+            for thread in [self.scanner_thread] + to_jump_threads + to_dest_threads:
                 thread.join(timeout=1.0)
 
         rprint(Panel.fit(

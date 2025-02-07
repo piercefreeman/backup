@@ -121,10 +121,10 @@ def test_full_transfer_flow(test_file_structure: Tuple[Path, dict[str, bytes]], 
     assert not any(f.is_file() for f in jump_files), "Jump drive should be empty after transfer"
     
     # Verify completion stats
-    assert len(manager.completed_to_jump) == len(test_file_structure[1])
-    assert len(manager.completed_to_dest) == len(test_file_structure[1])
-    assert manager.transferred_to_jump > 0
-    assert manager.transferred_to_dest > 0
+    assert len(manager.jump_sync.completed_files) == len(test_file_structure[1])
+    assert len(manager.dest_sync.completed_files) == len(test_file_structure[1])
+    assert manager.jump_sync.transferred_bytes > 0
+    assert manager.dest_sync.transferred_bytes > 0
 
 def test_skip_existing_files(test_file_structure: Tuple[Path, dict[str, bytes]], transfer_paths: Tuple[Path, Path, Path]):
     """Test that files are properly skipped when they exist at destination."""
