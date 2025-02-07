@@ -7,7 +7,6 @@ from typing import Any
 
 from icloudpd import download, exif_datetime
 from icloudpd.authentication import TwoStepAuthRequiredError, authenticator
-from icloudpd.logger import setup_logger
 from icloudpd.paths import clean_filename
 from pyicloud_ipd.exceptions import PyiCloudAPIResponseError
 from tzlocal import get_localzone
@@ -36,7 +35,10 @@ class ICloudPhotosDownloader:
     https://github.com/icloud-photos-downloader/icloud_photos_downloader/blob/master/icloudpd/base.py#L288
 
     """
-    def __init__(self, username: str, password: str, backend: BaseBackend, concurrency: int = 10):
+
+    def __init__(
+        self, username: str, password: str, backend: BaseBackend, concurrency: int = 10
+    ):
         self.username = username
         self.password = password
         self.backend = backend
@@ -49,11 +51,14 @@ class ICloudPhotosDownloader:
         print("Done getting metadata, starting sync...")
 
         with Pool(self.concurrency) as pool:
-            for _ in tqdm(pool.imap_unordered(
-                partial(self.sync_photo, icloud),
-                self.iter_photos(photos),
-            ), total=len(photos)):
-                pass    
+            for _ in tqdm(
+                pool.imap_unordered(
+                    partial(self.sync_photo, icloud),
+                    self.iter_photos(photos),
+                ),
+                total=len(photos),
+            ):
+                pass
 
     def get_core_images(self, icloud, album_name: str):
         try:
@@ -77,7 +82,9 @@ class ICloudPhotosDownloader:
             try:
                 created_date = photo.created.astimezone(get_localzone())
             except (ValueError, OSError):
-                error(f"Could not convert photo created date to local timezone ({photo.created})")
+                error(
+                    f"Could not convert photo created date to local timezone ({photo.created})"
+                )
                 created_date = photo.created
 
             # The remote path should be prefixed with the date
@@ -86,7 +93,7 @@ class ICloudPhotosDownloader:
             yield PhotoContext(
                 photo=photo,
                 created_date=created_date,
-                remote_path=os.path.join(date_path, filename)
+                remote_path=os.path.join(date_path, filename),
             )
 
     def sync_photo(self, icloud, photo_payload: PhotoContext):
@@ -100,37 +107,35 @@ class ICloudPhotosDownloader:
 
             start_time = datetime.now()
             download_result = download.download_media(
-                icloud,
-                photo_payload.photo,
-                download_path,
-                PHOTO_SIZE
+                icloud, photo_payload.photo, download_path, PHOTO_SIZE
             )
             debug("Download Duration (ms)", datetime.now() - start_time)
 
-            self.inject_exif(photo_payload.photo, download_result, download_path, photo_payload.created_date)
+            self.inject_exif(
+                photo_payload.photo,
+                download_result,
+                download_path,
+                photo_payload.created_date,
+            )
 
             # Write this file to remote
             with open(download_path, "rb") as file:
                 self.backend.write_file(photo_payload.remote_path, file.read())
 
     def inject_exif(
-            self,
-            photo,
-            download_result,
-            download_path: str,
-            created_date: datetime,
-            set_exif_datetime: bool = True
-        ):
+        self,
+        photo,
+        download_result,
+        download_path: str,
+        created_date: datetime,
+        set_exif_datetime: bool = True,
+    ):
         if not download_result:
             return
 
         if (
             set_exif_datetime
-            and (
-                clean_filename(photo.filename)
-                .lower()
-                .endswith((".jpg", ".jpeg"))
-            )
+            and (clean_filename(photo.filename).lower().endswith((".jpg", ".jpeg")))
             and not exif_datetime.get_photo_exif(download_path)
         ):
             # %Y:%m:%d looks wrong, but it's the correct format
